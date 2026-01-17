@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: OpenOccupancy
+Version: 0.0
+Summary: Stub package to satisfy EDEN requirements. No functionality.
+Author: stub
+Requires-Python: >=3.8

@@ -1,0 +1,35 @@
+*.log
+node_modules/
+venv/
+# --------------- 核心：排除所有模型权重格式 ---------------
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.h5
+*.pb
+*.onnx
+# 存放模型的目录，直接排除整个目录
+models/
+checkpoints/
+weights/
+flolpips/weights/
+
+# --------------- 其他无需上传的文件 ---------------
+# 数据集目录
+dataset/
+data/
+# Python环境/缓存
+venv/
+conda_env/
+__pycache__/
+*.pyc
+# 日志/临时文件
+*.log
+*.tmp
+output/
+interpolation_outputs/
+# 压缩包
+*.zip
+*.tar.gz
+*.7z*.tmp

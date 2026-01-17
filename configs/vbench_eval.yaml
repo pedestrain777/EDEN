@@ -1,0 +1,35 @@
+exp_name:  baseline_25_0
+output_root: results/vbench
+
+prompt_file: VBench-master/prompts/metadata/object_class.json
+negative_prompt_file: null
+
+models:
+  - pretrained_models/THUDM--CogVideoX-5B
+  - pretrained_models/THUDM--CogVideoX-2B
+steps: "25,0"
+
+num_frames: 49
+resolution:
+  height: 480
+  width: 720
+guidance_scale: 6.0
+fps: 8
+frame_format: png
+
+batch_size: 1
+seed_list:
+  - 1234
+
+reference_root: results/vbench/reference/baseline_25_0
+
+calc_psnr_ssim_lpips: true
+run_vbench_metrics: true
+measure_latency: true
+store_frames: false
+baseline_latency: null
+vbench_metrics:
+  - overall
+  - quality
+  - consistency
+

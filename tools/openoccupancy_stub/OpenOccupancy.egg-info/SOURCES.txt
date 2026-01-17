@@ -1,0 +1,6 @@
+pyproject.toml
+OpenOccupancy/__init__.py
+OpenOccupancy.egg-info/PKG-INFO
+OpenOccupancy.egg-info/SOURCES.txt
+OpenOccupancy.egg-info/dependency_links.txt
+OpenOccupancy.egg-info/top_level.txt

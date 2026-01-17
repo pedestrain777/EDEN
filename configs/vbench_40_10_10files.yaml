@@ -1,0 +1,51 @@
+exp_name: compare_40_10_10files
+output_root: results/vbench
+
+prompt_file: prompts/vbench_10files_top3.txt
+negative_prompt_file: null
+
+models:
+  - pretrained_models/THUDM--CogVideoX-5B
+  - pretrained_models/THUDM--CogVideoX-2B
+steps: "40,10"
+
+num_frames: 49
+resolution:
+  height: 480
+  width: 720
+guidance_scale: 6.0
+fps: 8
+frame_format: png
+
+batch_size: 1
+seed_list:
+  - 1234
+  - 2345
+  - 3456
+  - 4567
+  - 5678
+
+reference_root: results/vbench/reference/baseline_50_0
+
+calc_psnr_ssim_lpips: true
+run_vbench_metrics: true
+measure_latency: true
+store_frames: false
+baseline_latency: null
+vbench_metrics:
+  - subject_consistency
+  - background_consistency
+  - motion_smoothness
+  - dynamic_degree
+  - aesthetic_quality
+  - imaging_quality
+  - object_class
+  - multiple_objects
+  - human_action
+  - color
+  - spatial_relationship
+  - scene
+  - temporal_style
+  - appearance_style
+  - overall_consistency
+
