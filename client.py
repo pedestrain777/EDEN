@@ -9,6 +9,8 @@ import torch
 import torchvision
 from PIL import Image
 
+from src.scheduler.greedy_refine import greedy_refine
+
 
 def compute_motion_scores(video_frames, topk_ratio=0.1):
     """
@@ -72,6 +74,29 @@ def compute_motion_scores(video_frames, topk_ratio=0.1):
     motion_scores = alpha * global_motion + (1.0 - alpha) * local_norm
     motion_scores = np.clip(motion_scores, 0.0, 1.0)
     return motion_scores.tolist()
+
+
+def compute_pair_score(frame0: torch.Tensor, frame1: torch.Tensor, topk_ratio: float = 0.1, alpha: float = 0.5) -> float:
+    """
+    给任意两帧打一个"需要插帧"的分数（越大越需要优先插）。
+
+    frame0/frame1: [1,3,H,W]，值域[0,1]
+    """
+    with torch.no_grad():
+        # global: 1 - cosine similarity
+        cos = torch.cosine_similarity(frame0, frame1, dim=1).mean().item()
+        # 对于正值域图像，cos通常在[0,1]，直接用 1-cos 更直观
+        global_motion = 1.0 - max(0.0, min(1.0, cos))
+
+        # local: top-k pixel RGB difference
+        delta = (frame0 - frame1).abs().mean(dim=1)  # [1,H,W]
+        delta_flat = delta.view(-1)
+        k = max(1, int(topk_ratio * delta_flat.numel()))
+        topk_vals, _ = torch.topk(delta_flat, k)
+        local_mean = topk_vals.mean().item()  # 理论上就在[0,1]
+
+        s = alpha * global_motion + (1.0 - alpha) * local_mean
+        return float(max(0.0, min(1.0, s)))
 
 
 def tensor_to_b64_png(tensor: torch.Tensor) -> str:
@@ -213,64 +238,52 @@ def process_video(encoder_url: str, ditdec_url: str, video_path: str, output_dir
     print(f"Input video: {frames_num} frames, fps={fps}")
 
     if use_adaptive:
-        # ========== 自适应插帧模式 ==========
-        # 1. 第一遍：运动分析
-        print("Computing motion scores for each frame interval...")
-        motion_scores = compute_motion_scores(frames, topk_ratio=0.1)
-        motion_arr = np.array(motion_scores, dtype=np.float32)
+        # ========== 自适应插帧模式（Greedy refine，直到达到24fps） ==========
+        # 目标：填充成每秒24帧（24fps），而不是总帧数24
+        # 计算视频时长：duration = frames_num / fps
+        # 计算目标帧数：target_frames = duration * 24 = frames_num * 24 / fps
+        target_fps = 24
+        video_duration = frames_num / fps  # 视频时长（秒）
+        target_len = int(video_duration * target_fps)  # 达到24fps需要的总帧数
         
-        # 2. 根据中位数决定depth（只区分插1帧和插3帧）
-        if motion_arr.max() - motion_arr.min() < 1e-6:
-            # 所有区段运动差不多：统一插 1 帧
-            depths = [1] * (frames_num - 1)
-        else:
-            # 用中位数把区段切成两档：低/高 运动
-            mid_th = float(np.quantile(motion_arr, 0.5))
-            depths = []
-            for s in motion_scores:
-                if s >= mid_th:
-                    depth = 2    # 高运动：插 3 帧
-                else:
-                    depth = 1    # 低/中运动：插 1 帧
-                depths.append(depth)
+        # 1) 构造初始帧序列（这里用视频输入的全部帧作为初始帧）
+        #    如果你后面要"随机取帧/均匀取帧"当关键帧，这里换成你挑出来的 keyframes 即可
+        init_frames = [frames[i].unsqueeze(0).cpu() for i in range(frames_num)]
+        if len(init_frames) > target_len:
+            raise ValueError(f"initial frames ({len(init_frames)}) > target_len ({target_len}). "
+                             f"请先做关键帧/稀疏采样，或调整输入视频。")
         
-        print(
-            "Motion score stats:",
-            f"min={motion_arr.min():.4f}, max={motion_arr.max():.4f}, mean={motion_arr.mean():.4f}",
+        print(f"Greedy refinement: {len(init_frames)} frames -> {target_len} frames (24fps)")
+        print(f"Video duration: {video_duration:.2f}s, Target FPS: {target_fps}")
+        
+        def score_fn(a: torch.Tensor, b: torch.Tensor) -> float:
+            return compute_pair_score(a, b, topk_ratio=0.1, alpha=0.5)
+        
+        def interp_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # 这里直接复用你已有的 HTTP 单次中点插帧
+            return interpolate_http(encoder_url, ditdec_url, a, b)
+        
+        # 2) Greedy refine：每次挑"最需要插"的区间插一张中点，直到达到24fps的帧数
+        # 生成log文件路径（与输出视频在同一目录）
+        log_file_path = os.path.join(output_dir, "greedy_refinement.log")
+        
+        refined = greedy_refine(
+            init_frames,
+            target_len=target_len,
+            score_fn=score_fn,
+            interp_fn=interp_fn,
+            verbose=True,
+            log_file=log_file_path,
         )
+        
+        # 3) fps_out：固定为24fps（目标是24fps）
+        orig_frames = len(init_frames)
+        new_frames = len(refined)
+        fps_out = target_fps  # 固定输出为24fps
+        interpolated = refined  # 直接作为输出帧序列
         print(
-            "Depth distribution (1/2):",
-            depths.count(1),
-            depths.count(2),
-        )
-        
-        # 3. 第二遍：根据 depth 做递归插帧
-        interpolated = []
-        for i in range(frames_num - 1):
-            frame0 = frames[i].unsqueeze(0)  # [1,3,H,W]
-            frame1 = frames[i + 1].unsqueeze(0)
-            depth = depths[i]
-            
-            # 先放原始帧0
-            interpolated.append(frame0.cpu())
-            
-            # 递归插帧
-            print(f"Processing segment {i+1}/{frames_num-1} (depth={depth})...")
-            mids = recursive_interp_http(encoder_url, ditdec_url, frame0, frame1, depth)
-            for m in mids:
-                interpolated.append(m.cpu())
-            
-            del frame0, frame1, mids
-        
-        # 最后一帧
-        interpolated.append(frames[-1].unsqueeze(0).cpu())
-        
-        # 4. 计算新的 fps，使总时长尽量保持不变
-        orig_frames = frames_num
-        new_frames = len(interpolated)
-        fps_out = fps * (new_frames - 1) / max(1, (orig_frames - 1))
-        print(
-            f"Original frames: {orig_frames}, New frames: {new_frames}, fps_out ≈ {fps_out:.4f}"
+            f"Original: {orig_frames} frames @ {fps:.2f}fps, "
+            f"New: {new_frames} frames @ {fps_out:.2f}fps"
         )
     else:
         # ========== 固定插帧模式（每对帧之间插1帧） ==========

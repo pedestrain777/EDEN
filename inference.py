@@ -9,6 +9,8 @@ import yaml
 import os
 import numpy as np
 
+from src.scheduler.greedy_refine import greedy_refine
+
 
 def interpolate(frame0, frame1, use_split_gpu=False):
     """
@@ -196,6 +198,26 @@ def compute_motion_scores(video_frames, topk_ratio=0.1):
     return motion_scores.tolist()
 
 
+def compute_pair_score(frame0: torch.Tensor, frame1: torch.Tensor, topk_ratio: float = 0.1, alpha: float = 0.5) -> float:
+    """
+    给任意两帧打一个"需要插帧"的分数（越大越需要优先插）。
+
+    frame0/frame1: [1,3,H,W]，值域[0,1]
+    """
+    with torch.no_grad():
+        cos = torch.cosine_similarity(frame0, frame1, dim=1).mean().item()
+        global_motion = 1.0 - max(0.0, min(1.0, cos))
+
+        delta = (frame0 - frame1).abs().mean(dim=1)  # [1,H,W]
+        delta_flat = delta.view(-1)
+        k = max(1, int(topk_ratio * delta_flat.numel()))
+        topk_vals, _ = torch.topk(delta_flat, k)
+        local_mean = topk_vals.mean().item()
+
+        s = alpha * global_motion + (1.0 - alpha) * local_mean
+        return float(max(0.0, min(1.0, s)))
+
+
 def recursive_interp(frame0, frame1, depth, use_split_gpu=False):
     """
     递归插帧：
@@ -313,81 +335,53 @@ if video_path:
     frames_num = video_frames.shape[0]
     print(f"Input video: {frames_num} frames, fps={fps}")
 
-    # 2. 第一遍：运动分析（per-video 标准化 + 局部 top-k）
-    print("Computing motion scores for each frame interval...")
-    motion_scores = compute_motion_scores(video_frames, topk_ratio=0.1)
-    motion_arr = np.array(motion_scores, dtype=np.float32)
-
-    if motion_arr.max() - motion_arr.min() < 1e-6:
-        # 所有区段运动差不多：统一插 1 帧
-        depths = [1] * (frames_num - 1)
-    else:
-        # 用中位数把区段切成两档：低/高 运动
-        mid_th = float(np.quantile(motion_arr, 0.5))
-        depths = []
-        for s in motion_scores:
-            if s >= mid_th:
-                depth = 2    # 高运动：插 3 帧
-            else:
-                depth = 1    # 低/中运动：插 1 帧
-            depths.append(depth)
-
-    print(
-        "Motion score stats:",
-        f"min={motion_arr.min():.4f}, max={motion_arr.max():.4f}, mean={motion_arr.mean():.4f}",
+    # 2) Greedy refine：直到达到24fps
+    # 目标：填充成每秒24帧（24fps），而不是总帧数24
+    # 计算视频时长：duration = frames_num / fps
+    # 计算目标帧数：target_frames = duration * 24 = frames_num * 24 / fps
+    target_fps = 24
+    video_duration = frames_num / fps  # 视频时长（秒）
+    target_len = int(video_duration * target_fps)  # 达到24fps需要的总帧数
+    
+    init_frames = [video_frames[i].unsqueeze(0).cpu() for i in range(frames_num)]
+    if len(init_frames) > target_len:
+        raise ValueError(f"initial frames ({len(init_frames)}) > target_len ({target_len}). "
+                         f"请先做关键帧/稀疏采样，或调整输入视频。")
+    
+    print(f"Greedy refinement: {len(init_frames)} frames -> {target_len} frames (24fps)")
+    print(f"Video duration: {video_duration:.2f}s, Target FPS: {target_fps}")
+    
+    def score_fn(a: torch.Tensor, b: torch.Tensor) -> float:
+        return compute_pair_score(a, b, topk_ratio=0.1, alpha=0.5)
+    
+    def interp_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # 复用你现有的 EDEN 插一张中点帧（单GPU/双GPU都支持）
+        with torch.no_grad():
+            return interpolate(a, b, use_split_gpu=args.use_split_gpu).cpu()
+    
+    # 生成log文件路径（与输出视频在同一目录）
+    log_file_path = os.path.join(interpolated_results_dir, "greedy_refinement.log")
+    
+    refined = greedy_refine(
+        init_frames,
+        target_len=target_len,
+        score_fn=score_fn,
+        interp_fn=interp_fn,
+        verbose=True,
+        log_file=log_file_path,
     )
+    
+    # 3) fps_out：固定为24fps（目标是24fps）
+    orig_frames = len(init_frames)
+    new_frames = len(refined)
+    fps_out = target_fps  # 固定输出为24fps
     print(
-        "Depth distribution (1/2):",
-        depths.count(1),
-        depths.count(2),
+        f"Original: {orig_frames} frames @ {fps:.2f}fps, "
+        f"New: {new_frames} frames @ {fps_out:.2f}fps"
     )
-
-    # 3. 第二遍：根据 depth 做递归插帧
-    interpolated_video = []
-    for i in range(frames_num - 1):
-        frame_0 = video_frames[i].unsqueeze(0)  # [1,3,H,W]
-        frame_1 = video_frames[i + 1].unsqueeze(0)
-        depth = depths[i]
-
-        # 先放原始帧0
-        interpolated_video.append(frame_0.cpu())
-
-        if depth > 0:
-            with torch.no_grad():
-                mids = recursive_interp(
-                    frame_0,
-                    frame_1,
-                    depth,
-                    use_split_gpu=args.use_split_gpu,
-                )
-            for m in mids:
-                interpolated_video.append(m.cpu())
-            del mids
-
-        # 清理显存
-        if args.use_split_gpu:
-            torch.cuda.empty_cache()
-            torch.cuda.empty_cache()
-        else:
-            torch.cuda.empty_cache()
-
-        del frame_0, frame_1
-
-    # 最后一帧
-    interpolated_video.append(video_frames[-1].unsqueeze(0))
-
-    # 4. 计算新的 fps，使总时长尽量保持不变
-    orig_frames = frames_num
-    new_frames = len(interpolated_video)
-    fps_out = fps * (new_frames - 1) / max(1, (orig_frames - 1))
-    print(
-        f"Original frames: {orig_frames}, New frames: {new_frames}, fps_out ≈ {fps_out:.4f}"
-    )
-
-    # 5. 写回视频
-    interpolated_video = (
-        torch.cat(interpolated_video, dim=0).permute(0, 2, 3, 1) * 255.0
-    ).cpu()
+    
+    # 4) 写回视频（沿用你原来的写法）
+    interpolated_video = (torch.cat(refined, dim=0).permute(0, 2, 3, 1) * 255.0).byte().cpu()
     torchvision.io.write_video(
         interpolated_video_save_path, interpolated_video, fps=fps_out
     )
