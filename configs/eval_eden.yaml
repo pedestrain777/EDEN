@@ -1,6 +1,6 @@
 model_name: "EDEN"
 mixed_precision: "no"
-pretrained_eden_path: checkpoints/eden.pt
+pretrained_eden_path: /data/models/eden_checkpoint/eden.pt
 cos_sim_mean: 0.990539
 cos_sim_std: 0.0608093
 vae_scaler: 0.179437

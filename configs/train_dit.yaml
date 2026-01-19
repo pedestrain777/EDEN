@@ -57,7 +57,7 @@ val_dataloader:
 output_dir: output # experiment outputs dir
 global_seed: 0
 train_args:
-  pretrained_vae_path: checkpoints/eden_vae.pt  # pretrained vae ckpt path
+  pretrained_vae_path: /data/models/eden_checkpoint/eden_vae.pt  # pretrained vae ckpt path
   resume_from_ckpt: null  # pretrained dit ckpt path, if resume from pretrained dit
   epochs: 100
   base_lr: 1.25e-05
